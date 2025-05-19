@@ -25,7 +25,12 @@ def parse_args():
                         help='Path to save output video (default: output.mp4)')
     parser.add_argument('--demo', action='store_true',
                         help='Run in demo mode with animated faces')
-    
+    parser.add_argument('--processing_width', type=int, default=320,
+                        help='Width to resize frames for processing (smaller = faster)')
+    parser.add_argument('--process_every', type=int, default=2,
+                        help='Process every Nth frame for detection (higher = faster)')
+    parser.add_argument('--occlusion_detection', action='store_true', help='Enable detection of objects covering the face')
+
     return parser.parse_args()
 
 def main():
@@ -97,10 +102,18 @@ def main():
     # Create directory for models if it doesn't exist
     os.makedirs("models", exist_ok=True)
     
-    # Initialize face detector and recognizers
+    # Initialize face detector and recognizers with optimized parameters
     face_detector = FaceDetector(min_detection_confidence=0.5)
+    face_detector.detect_occlusions = args.occlusion_detection
     emotion_recognizer = EmotionRecognizer()
     age_estimator = AgeEstimator()
+    
+    # Processing parameters for performance optimization
+    process_width = args.processing_width
+    process_every = args.process_every
+    frame_count = 0
+    last_frame_time = time.time()
+    processing_frame = None  # Store the frame being processed
     
     # FPS calculator
     fps_counter = FPS()
@@ -121,9 +134,23 @@ def main():
         demo_ages = ['0-2', '3-9', '10-19', '20-29', '30-39', '40-49', '50-59', '60-69', '70+']
         frame_count = 0
     
-    print("Starting video processing. Press 'q' to quit.")
+    # Set up window
+    window_name = "Real-time Face Analysis"
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(window_name, frame_width, frame_height)
+    
+    # Print status information
+    print(f"Starting video processing with:")
+    print(f" - Processing every {process_every} frame(s)")
+    print(f" - Processing width: {process_width} pixels")
+    print(f" - Occlusion detection: {'Enabled' if args.occlusion_detection else 'Disabled'}") 
+    print("Press 'q' to quit.")
     
     while True:
+        current_time = time.time()
+        frame_time_delta = current_time - last_frame_time
+        last_frame_time = current_time
+        
         if use_demo_mode:
             # Create a blank frame with gray background
             frame = np.ones((frame_height, frame_width, 3), dtype=np.uint8) * 64
@@ -190,7 +217,7 @@ def main():
             frame = np.zeros((frame_height, frame_width, 3), dtype=np.uint8)
             
             # Draw a simple face pattern
-            cv2.ellipse(frame, (frame_width//2, frame_height//2), (100, 130), 0, 0, 360, (0, 255, 255), -1)  # Face
+            cv2.rectangle(frame, (frame_width//2 - 100, frame_height//2 - 130), (frame_width//2 + 100, frame_height//2 + 130), (200, 200, 0), 2)
             cv2.circle(frame, (frame_width//2 - 40, frame_height//2 - 30), 20, (255, 255, 255), -1)  # Left eye
             cv2.circle(frame, (frame_width//2 + 40, frame_height//2 - 30), 20, (255, 255, 255), -1)  # Right eye
             cv2.ellipse(frame, (frame_width//2, frame_height//2 + 20), (60, 30), 0, 0, 180, (0, 0, 255), -1)  # Mouth
@@ -210,9 +237,45 @@ def main():
         # Start timing for this frame
         start_time = time.time()
         
-        # Detect faces (only if not in demo mode, as demo already provides faces)
-        if not use_demo_mode:
-            detected_faces = face_detector.detect_faces(frame)
+        # Only process every Nth frame to improve framerate (skip frames)
+        # But always draw using the latest detection results
+        if not use_demo_mode and (frame_count % process_every == 0):
+            # Get smaller frame for processing to improve speed
+            if frame.shape[1] > process_width:
+                aspect_ratio = frame.shape[0] / frame.shape[1]
+                process_height = int(process_width * aspect_ratio)
+                processing_frame = cv2.resize(frame, (process_width, process_height))
+            else:
+                processing_frame = frame.copy()
+                
+            # Detect faces on the smaller frame
+            detected_faces = face_detector.detect_faces(processing_frame)
+            
+            # Scale bounding boxes back to original frame size if needed
+            if frame.shape[1] > process_width:
+                scale_x = frame.shape[1] / process_width
+                scale_y = frame.shape[0] / process_height
+                
+                for face in detected_faces:
+                    x_min, y_min, x_max, y_max = face['bbox']
+                    x_min = int(x_min * scale_x)
+                    y_min = int(y_min * scale_y)
+                    x_max = int(x_max * scale_x)
+                    y_max = int(y_max * scale_y)
+                    
+                    # Update bbox
+                    face['bbox'] = (x_min, y_min, x_max, y_max)
+                    
+                    # Update landmarks
+                    for key in face['landmarks']:
+                        x, y = face['landmarks'][key]
+                        face['landmarks'][key] = (int(x * scale_x), int(y * scale_y))
+                    
+                    # Extract face ROI from original frame
+                    face['face_roi'] = frame[y_min:y_max, x_min:x_max] if 0 <= y_min < y_max < frame.shape[0] and 0 <= x_min < x_max < frame.shape[1] else None
+            
+        # Increment frame counter
+        frame_count += 1
         
         # Apply face tracking to maintain consistent IDs
         tracked_faces = prediction_smoother.update_face_tracking(detected_faces)
@@ -236,7 +299,65 @@ def main():
                 emotion_result = prediction_smoother.smooth_emotion_prediction(face_id, raw_emotion_result)
                 age_result = prediction_smoother.smooth_age_prediction(face_id, raw_age_result)
                 
-                # Draw bounding box and landmarks
+                # Check if there are any occlusions detected and print debug info
+                if 'occlusions' in face_info and face_info['occlusions']:
+                    print(f"Main.py: Found {len(face_info['occlusions'])} occlusions to display")
+                    
+                    # Draw a VERY obvious warning about occlusions
+                    # Add a red banner across the top of the screen
+                    cv2.rectangle(frame, (0, 0), (frame.shape[1], 80), (0, 0, 255), -1)
+                    
+                    # Add white text on the red background
+                    cv2.putText(
+                        frame,
+                        f"OBJECT COVERING FACE DETECTED!",
+                        (frame.shape[1]//2 - 240, 40),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        1,
+                        (255, 255, 255),  # White color
+                        2
+                    )
+                    
+                    # Draw each occlusion directly on the frame
+                    for occlusion in face_info['occlusions']:
+                        # Get bounding box
+                        x_min, y_min, x_max, y_max = occlusion['bbox']
+                        
+                        # Draw a thick bright red box around the occlusion
+                        cv2.rectangle(
+                            frame,
+                            (int(x_min), int(y_min)),
+                            (int(x_max), int(y_max)),
+                            (0, 0, 255),  # Red color
+                            4  # Very thick
+                        )
+                        
+                        # Add a semi-transparent red overlay
+                        overlay = frame.copy()
+                        cv2.rectangle(
+                            overlay,
+                            (int(x_min), int(y_min)),
+                            (int(x_max), int(y_max)),
+                            (0, 0, 255),  # Red
+                            -1  # Fill
+                        )
+                        # Apply with transparency
+                        cv2.addWeighted(overlay, 0.4, frame, 0.6, 0, frame)
+                        
+                        # Add text label above the box
+                        cv2.putText(
+                            frame,
+                            f"OBJECT",
+                            (int(x_min), int(y_min) - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.7,
+                            (0, 0, 255),  # Red
+                            2  # Thick
+                        )
+                else:
+                    print("Main.py: No occlusions found in face_info")
+                
+                # Draw bounding box, landmarks, and occlusions if detected
                 frame = face_detector.draw_detections(frame, [face_info], show_confidence=False)
                 
                 # Draw prediction results
